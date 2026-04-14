@@ -28,22 +28,53 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# mongo_url = os.environ['MONGO_URL']
+# client = AsyncIOMotorClient(mongo_url)
+# db = client[os.environ['DB_NAME']]
 
 LLM_API_KEY = os.environ.get('LLM_API_KEY')
 JWT_SECRET = os.environ.get('JWT_SECRET')
 JWT_ALGORITHM = "HS256"
 
-app = FastAPI()
-api_router = APIRouter(prefix="/api")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- STARTUP: Connect to MongoDB ---
+    print("Connecting to MongoDB Atlas...")
+    
+    # Use global keywords so your existing routes (like /auth/register) 
+    # that use 'client' and 'db' still work without changing them.
+    global client, db
+    
+    mongo_url = os.environ.get('MONGO_URL')
+    db_name = os.environ.get('DB_NAME')
+    
+    client = AsyncIOMotorClient(mongo_url)
+    db = client[db_name]
+    
+    print(f"Connected to Database: {db_name}")
+    
+    yield  # --- App is running here ---
+    
+    # --- SHUTDOWN: Close the connection ---
+    print("Closing MongoDB connection...")
+    client.close()
 
+app = FastAPI(lifespan=lifespan)
+api_router = APIRouter(prefix="/api")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # For now, "*" is fine. Later, we will put your Vercel URL here.
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+app.include_router(api_router)
 
 # ============ Password & JWT Helpers ============
 
