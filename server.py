@@ -1193,12 +1193,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    # Seed admin user
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ============ 1. STARTUP LOGIC ============
+    print("Connecting to MongoDB Atlas...")
+    global client, db
+    
+    mongo_url = os.environ.get('MONGO_URL')
+    db_name = os.environ.get('DB_NAME')
+    
+    client = AsyncIOMotorClient(mongo_url)
+    db = client[db_name]
+    
+    # --- Seed admin user ---
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@fitnessai.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "FitnessAI@2026")
     existing = await db.users.find_one({"email": admin_email}, {"_id": 0})
+    
     if not existing:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         await db.users.insert_one({
@@ -1216,9 +1227,27 @@ async def startup_event():
             {"$set": {"password_hash": hash_password(admin_password)}}
         )
         logger.info("Admin password updated")
-    # Create indexes
-    await db.users.create_index("email", unique=True)
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
+    # --- Create indexes ---
+    await db.users.create_index("email", unique=True)
+    print(f"Connected to Database: {db_name}")
+
+    yield  # <--- This is the boundary. Everything above runs on start.
+
+    # ============ 2. SHUTDOWN LOGIC ============
+    print("Closing MongoDB connection...")
     client.close()
+
+# Update your app declaration at the top or bottom of your setup:
+app = FastAPI(lifespan=lifespan)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    
+    # This print will tell us the script actually started
+    print("Starting Uvicorn server...") 
+    
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
