@@ -14,7 +14,7 @@ import secrets
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt as pyjwt
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+import google.generativeai as genai       # ← public SDK (pip install google-generativeai)
 from bs4 import BeautifulSoup
 from fpdf import FPDF
 import httpx
@@ -33,13 +33,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Single app instance — no duplicates
 app = FastAPI(title="FitnessAI API")
 api_router = APIRouter(prefix="/api")
 
-# ============ CORS — configured ONCE, before any routes ============
-# List every origin that is allowed to call your API.
-# Add your Vercel URL here. Do NOT use "*" with credentials=True.
+# ============ CORS ============
+
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5173",
@@ -54,7 +52,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============ Database — single global connection ============
+# ============ Database ============
+
 mongo_url = os.environ.get("MONGO_URL")
 db_name = os.environ.get("DB_NAME")
 client = AsyncIOMotorClient(mongo_url)
@@ -63,6 +62,33 @@ db = client[db_name]
 LLM_API_KEY = os.environ.get("LLM_API_KEY")
 JWT_SECRET = os.environ.get("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
+
+# ============ Gemini Client Helper ============
+
+# Configure the Gemini SDK once with the API key
+genai.configure(api_key=LLM_API_KEY)
+
+
+async def llm_complete(
+    system: str,
+    user_text: str,
+    model: str = "gemini-2.0-flash",
+    max_tokens: int = 1500,
+) -> str:
+    """
+    Single-turn LLM call using the official Google Generative AI SDK.
+    Combines system prompt + user message and calls Gemini asynchronously.
+    """
+    gemini_model = genai.GenerativeModel(
+        model_name=model,
+        system_instruction=system,
+        generation_config=genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
+            temperature=0.7,
+        ),
+    )
+    response = await gemini_model.generate_content_async(user_text)
+    return response.text
 
 # ============ Password & JWT Helpers ============
 
@@ -474,33 +500,45 @@ def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
 # ============ RAG & Intent ============
 
 async def classify_intent(message: str) -> str:
+    """Classify message into one of the fitness intent categories."""
     try:
-        chat = LlmChat(
-            api_key=LLM_API_KEY,
-            session_id=f"intent_{uuid.uuid4().hex[:8]}",
-            system_message="You are an intent classifier for a fitness app. Classify the user's message into exactly ONE category: WORKOUT, NUTRITION, DIETARY_ADVICE, GENERAL_HEALTH, or OTHER. Respond with ONLY the category name.",
-        ).with_model("gemini", "gemini-2.0-flash")
-        response = await chat.send_message(UserMessage(text=message))
-        intent = response.strip().upper().replace(" ", "_")
+        system = (
+            "You are an intent classifier for a fitness app. "
+            "Classify the user's message into exactly ONE category: "
+            "WORKOUT, NUTRITION, DIETARY_ADVICE, GENERAL_HEALTH, or OTHER. "
+            "Respond with ONLY the category name, nothing else."
+        )
+        result = await llm_complete(system=system, user_text=message, max_tokens=20)
+        intent = result.strip().upper().replace(" ", "_")
         valid = ["WORKOUT", "NUTRITION", "DIETARY_ADVICE", "GENERAL_HEALTH", "OTHER"]
         return intent if intent in valid else "OTHER"
     except Exception as e:
         logger.error(f"Intent classification error: {e}")
         return "OTHER"
 
+
 async def generate_rag_response(message: str, intent: str, user_id: str) -> str:
+    """Generate a RAG-augmented response using the Anthropic SDK."""
     try:
         if intent == "OTHER":
-            system_msg = "You are FitnessAI, a fitness and health coach. The user asked something outside your scope. Respond in 1-2 sentences: politely say you only help with fitness, nutrition, and health topics, then suggest one relevant fitness question they could ask. Keep it under 40 words."
-            chat = LlmChat(api_key=LLM_API_KEY, session_id=f"rag_{uuid.uuid4().hex[:8]}", system_message=system_msg).with_model("gemini", "gemini-2.0-flash")
-            return await chat.send_message(UserMessage(text=message))
+            system = (
+                "You are FitnessAI, a fitness and health coach. "
+                "The user asked something outside your scope. "
+                "Respond in 1-2 sentences: politely say you only help with fitness, "
+                "nutrition, and health topics, then suggest one relevant fitness question "
+                "they could ask. Keep it under 40 words."
+            )
+            return await llm_complete(system=system, user_text=message, max_tokens=100)
 
         static_knowledge = KNOWLEDGE_BASE.get(intent, KNOWLEDGE_BASE["GENERAL_HEALTH"])
         profile_context = await get_user_profile_context(user_id)
         scraped_knowledge = await get_scraped_knowledge(intent)
-        scraped_section = f"\n\n## Live Data from Trusted Health Sources:\n{scraped_knowledge[:3000]}" if scraped_knowledge else ""
+        scraped_section = (
+            f"\n\n## Live Data from Trusted Health Sources:\n{scraped_knowledge[:3000]}"
+            if scraped_knowledge else ""
+        )
 
-        system_msg = f"""You are FitnessAI, a knowledgeable and encouraging AI fitness coach. You provide evidence-based advice using trusted health information.
+        system = f"""You are FitnessAI, a knowledgeable and encouraging AI fitness coach. You provide evidence-based advice using trusted health information.
 
 ## Trusted Knowledge Base:
 {static_knowledge}
@@ -519,8 +557,8 @@ async def generate_rag_response(message: str, intent: str, user_id: str) -> str:
 - Use --- between major sections
 - Never use emoji characters"""
 
-        chat = LlmChat(api_key=LLM_API_KEY, session_id=f"rag_{uuid.uuid4().hex[:8]}", system_message=system_msg).with_model("gemini", "gemini-2.0-flash")
-        return await chat.send_message(UserMessage(text=message))
+        return await llm_complete(system=system, user_text=message, max_tokens=1500)
+
     except Exception as e:
         logger.error(f"RAG response error: {e}")
         return "I'm having trouble processing your request. Please try again in a moment."
@@ -751,15 +789,15 @@ async def generate_meal_plan(request: Request):
     user_id = await get_current_user(request)
     profile_context = await get_user_profile_context(user_id)
     import json
-    try:
-        chat = LlmChat(
-            api_key=LLM_API_KEY,
-            session_id=f"meal_{uuid.uuid4().hex[:8]}",
-            system_message=f"""You are a nutrition expert. Generate a balanced daily meal plan.
+    system = f"""You are a nutrition expert. Generate a balanced daily meal plan.
 {profile_context}
 Return ONLY valid JSON (no markdown fences) as an array of meals with keys: meal_type, name, description, calories, protein, carbs, fats."""
-        ).with_model("gemini", "gemini-2.0-flash")
-        response = await chat.send_message(UserMessage(text="Generate a personalized healthy meal plan for today"))
+    try:
+        response = await llm_complete(
+            system=system,
+            user_text="Generate a personalized healthy meal plan for today",
+            max_tokens=1000,
+        )
         clean = response.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         meals = json.loads(clean)
     except Exception as e:
@@ -800,15 +838,15 @@ async def generate_workout(request: Request):
     user_id = await get_current_user(request)
     profile_context = await get_user_profile_context(user_id)
     import json
-    try:
-        chat = LlmChat(
-            api_key=LLM_API_KEY,
-            session_id=f"workout_{uuid.uuid4().hex[:8]}",
-            system_message=f"""You are a certified personal trainer. Generate a workout plan.
+    system = f"""You are a certified personal trainer. Generate a workout plan.
 {profile_context}
 Return ONLY valid JSON (no markdown fences) as an array of exercises with keys: name, sets, reps, rest, muscle_group, tips. Include 5-7 exercises."""
-        ).with_model("gemini", "gemini-2.0-flash")
-        response = await chat.send_message(UserMessage(text="Generate a personalized workout for today"))
+    try:
+        response = await llm_complete(
+            system=system,
+            user_text="Generate a personalized workout for today",
+            max_tokens=1000,
+        )
         clean = response.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         exercises = json.loads(clean)
     except Exception as e:
@@ -913,7 +951,7 @@ async def get_rag_status(request: Request):
                           "content_length": len(cached.get("content", "")) if cached else 0})
     return {"knowledge_sources": statuses}
 
-# ============ Register router — ONCE, at the end ============
+# ============ Register router ============
 app.include_router(api_router)
 
 if __name__ == "__main__":
