@@ -39,18 +39,18 @@ api_router = APIRouter(prefix="/api")
 # ============ CORS ============
 
 ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    os.environ.get("FRONTEND_URL", "https://your-fitness-app.vercel.app"),
-]
+        "http://localhost:3000",
+        "http://localhost:5173",
+        os.environ.get("FRONTEND_URL", "https://fitness-ai-frontend-ipbd6ubgy-07rishabh-ydvs-projects.vercel.app"),
+    ]
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # ============ Database ============
 
