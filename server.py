@@ -42,7 +42,7 @@ api_router = APIRouter(prefix="/api")
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5173",
-    os.environ.get("FRONTEND_URL", "https://fitness-ai-frontend-three.vercel.app/"),
+    os.environ.get("FRONTEND_URL", "https://fitness-ai-frontend-three.vercel.app"),
 ]
 
 app.add_middleware(
