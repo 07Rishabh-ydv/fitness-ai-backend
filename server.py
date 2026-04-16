@@ -6,6 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import io
+import json
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 from typing import Optional
@@ -14,7 +15,7 @@ import secrets
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt as pyjwt
-import google.generativeai as genai       # ← public SDK (pip install google-generativeai)
+from groq import AsyncGroq              # pip install groq
 from bs4 import BeautifulSoup
 from fpdf import FPDF
 import httpx
@@ -39,18 +40,18 @@ api_router = APIRouter(prefix="/api")
 # ============ CORS ============
 
 ALLOWED_ORIGINS = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        os.environ.get("FRONTEND_URL", "https://fitness-ai-frontend-ipbd6ubgy-07rishabh-ydvs-projects.vercel.app"),
-    ]
+    "http://localhost:3000",
+    "http://localhost:5173",
+    os.environ.get("FRONTEND_URL", "https://fitness-ai-frontend-ipbd6ubgy-07rishabh-ydvs-projects.vercel.app"),
+]
 
 app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============ Database ============
 
@@ -59,36 +60,34 @@ db_name = os.environ.get("DB_NAME")
 client = AsyncIOMotorClient(mongo_url)
 db = client[db_name]
 
-LLM_API_KEY = os.environ.get("LLM_API_KEY")
+LLM_API_KEY = os.environ.get("LLM_API_KEY")   # Set this to your Groq API key in .env
 JWT_SECRET = os.environ.get("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
 
-# ============ Gemini Client Helper ============
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# Configure the Gemini SDK once with the API key
-genai.configure(api_key=LLM_API_KEY)
-
+# ============ Groq LLM Helper ============
 
 async def llm_complete(
     system: str,
     user_text: str,
-    model: str = "gemini-2.0-flash",
     max_tokens: int = 1500,
 ) -> str:
     """
-    Single-turn LLM call using the official Google Generative AI SDK.
-    Combines system prompt + user message and calls Gemini asynchronously.
+    Single-turn LLM call using the Groq async client.
+    Drop-in replacement for the emergentintegrations LlmChat pattern.
     """
-    gemini_model = genai.GenerativeModel(
-        model_name=model,
-        system_instruction=system,
-        generation_config=genai.types.GenerationConfig(
-            max_output_tokens=max_tokens,
-            temperature=0.7,
-        ),
+    groq_client = AsyncGroq(api_key=LLM_API_KEY)
+    response = await groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        max_tokens=max_tokens,
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_text},
+        ],
     )
-    response = await gemini_model.generate_content_async(user_text)
-    return response.text
+    return response.choices[0].message.content
 
 # ============ Password & JWT Helpers ============
 
@@ -401,8 +400,14 @@ def generate_meal_pdf(plan: dict, user_name: str = "User") -> bytes:
             pdf.set_font("Helvetica", "", 9)
             pdf.set_text_color(100, 100, 100)
             pdf.multi_cell(0, 5, meal["description"])
-        cal, protein, carbs, fats = meal.get("calories", 0), meal.get("protein", 0), meal.get("carbs", 0), meal.get("fats", 0)
-        total_cal += cal; total_protein += protein; total_carbs += carbs; total_fats += fats
+        cal = meal.get("calories", 0)
+        protein = meal.get("protein", 0)
+        carbs = meal.get("carbs", 0)
+        fats = meal.get("fats", 0)
+        total_cal += cal
+        total_protein += protein
+        total_carbs += carbs
+        total_fats += fats
         pdf.set_font("Helvetica", "", 9)
         pdf.set_text_color(0, 122, 255)
         pdf.cell(0, 6, f"{cal} cal  |  P: {protein}g  |  C: {carbs}g  |  F: {fats}g", new_x="LMARGIN", new_y="NEXT")
@@ -518,7 +523,7 @@ async def classify_intent(message: str) -> str:
 
 
 async def generate_rag_response(message: str, intent: str, user_id: str) -> str:
-    """Generate a RAG-augmented response using the Anthropic SDK."""
+    """Generate a RAG-augmented response using Groq."""
     try:
         if intent == "OTHER":
             system = (
@@ -553,7 +558,7 @@ async def generate_rag_response(message: str, intent: str, user_id: str) -> str:
 - Keep each section concise — 3-5 bullet points max
 - Add a brief motivational line at the end
 - Cite sources when relevant (e.g., "According to WHO...")
-- If giving a plan, organize as: Overview → Details → Tips → Disclaimer
+- If giving a plan, organize as: Overview -> Details -> Tips -> Disclaimer
 - Use --- between major sections
 - Never use emoji characters"""
 
@@ -788,29 +793,49 @@ async def delete_chat_session(chat_session_id: str, request: Request):
 async def generate_meal_plan(request: Request):
     user_id = await get_current_user(request)
     profile_context = await get_user_profile_context(user_id)
-    import json
+
     system = f"""You are a nutrition expert. Generate a balanced daily meal plan.
 {profile_context}
-Return ONLY valid JSON (no markdown fences) as an array of meals with keys: meal_type, name, description, calories, protein, carbs, fats."""
+
+Return ONLY valid JSON (no markdown fences) as an array of meals with these exact keys:
+meal_type, name, description, calories, protein, carbs, fats
+
+Example:
+[
+  {{"meal_type": "Breakfast", "name": "Oatmeal", "description": "Steel-cut oats with berries", "calories": 350, "protein": 12, "carbs": 55, "fats": 10}},
+  {{"meal_type": "Morning Snack", "name": "Greek Yogurt", "description": "Low-fat yogurt with honey", "calories": 150, "protein": 15, "carbs": 18, "fats": 3}},
+  {{"meal_type": "Lunch", "name": "Chicken Bowl", "description": "Grilled chicken with quinoa", "calories": 520, "protein": 40, "carbs": 50, "fats": 16}},
+  {{"meal_type": "Afternoon Snack", "name": "Apple & Peanut Butter", "description": "Apple with 2 tbsp peanut butter", "calories": 200, "protein": 7, "carbs": 25, "fats": 10}},
+  {{"meal_type": "Dinner", "name": "Salmon & Sweet Potato", "description": "Baked salmon with roasted sweet potato", "calories": 480, "protein": 35, "carbs": 40, "fats": 18}}
+]"""
+
     try:
         response = await llm_complete(
             system=system,
             user_text="Generate a personalized healthy meal plan for today",
             max_tokens=1000,
         )
-        clean = response.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        clean = response.strip()
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+            clean = clean.rsplit("```", 1)[0]
         meals = json.loads(clean)
     except Exception as e:
         logger.error(f"Meal parse error: {e}")
         meals = [
-            {"meal_type": "Breakfast", "name": "Oatmeal with Berries & Almonds", "description": "Steel-cut oats topped with mixed berries", "calories": 350, "protein": 12, "carbs": 55, "fats": 10},
-            {"meal_type": "Lunch", "name": "Grilled Chicken Quinoa Bowl", "description": "Grilled chicken with quinoa and vegetables", "calories": 520, "protein": 40, "carbs": 50, "fats": 16},
-            {"meal_type": "Dinner", "name": "Baked Salmon with Sweet Potato", "description": "Salmon fillet with roasted sweet potato and broccoli", "calories": 480, "protein": 35, "carbs": 40, "fats": 18},
+            {"meal_type": "Breakfast", "name": "Oatmeal with Berries & Almonds", "description": "Steel-cut oats topped with mixed berries and sliced almonds", "calories": 350, "protein": 12, "carbs": 55, "fats": 10},
+            {"meal_type": "Morning Snack", "name": "Greek Yogurt & Honey", "description": "Low-fat Greek yogurt with a drizzle of honey", "calories": 150, "protein": 15, "carbs": 18, "fats": 3},
+            {"meal_type": "Lunch", "name": "Grilled Chicken Quinoa Bowl", "description": "Grilled chicken breast with quinoa, roasted vegetables, and tahini dressing", "calories": 520, "protein": 40, "carbs": 50, "fats": 16},
+            {"meal_type": "Afternoon Snack", "name": "Apple with Peanut Butter", "description": "Sliced apple with 2 tbsp natural peanut butter", "calories": 200, "protein": 7, "carbs": 25, "fats": 10},
+            {"meal_type": "Dinner", "name": "Baked Salmon with Sweet Potato", "description": "Herb-crusted salmon fillet with roasted sweet potato and steamed broccoli", "calories": 480, "protein": 35, "carbs": 40, "fats": 18},
         ]
+
     plan_id = f"plan_{uuid.uuid4().hex[:12]}"
-    doc = {"plan_id": plan_id, "user_id": user_id, "meals": meals,
-           "date": datetime.now(timezone.utc).date().isoformat(),
-           "created_at": datetime.now(timezone.utc).isoformat()}
+    doc = {
+        "plan_id": plan_id, "user_id": user_id, "meals": meals,
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
     await db.meal_plans.insert_one(doc)
     return {"plan_id": plan_id, "meals": meals, "date": doc["date"]}
 
@@ -827,9 +852,11 @@ async def export_meal_pdf(plan_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Meal plan not found")
     user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     user_name = user_doc.get("name", "User") if user_doc else "User"
-    return StreamingResponse(io.BytesIO(generate_meal_pdf(plan, user_name)),
+    return StreamingResponse(
+        io.BytesIO(generate_meal_pdf(plan, user_name)),
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=meal_plan_{plan.get('date', 'today')}.pdf"})
+        headers={"Content-Disposition": f"attachment; filename=meal_plan_{plan.get('date', 'today')}.pdf"},
+    )
 
 # ============ Workout Endpoints ============
 
@@ -837,17 +864,32 @@ async def export_meal_pdf(plan_id: str, request: Request):
 async def generate_workout(request: Request):
     user_id = await get_current_user(request)
     profile_context = await get_user_profile_context(user_id)
-    import json
+
     system = f"""You are a certified personal trainer. Generate a workout plan.
 {profile_context}
-Return ONLY valid JSON (no markdown fences) as an array of exercises with keys: name, sets, reps, rest, muscle_group, tips. Include 5-7 exercises."""
+
+Return ONLY valid JSON (no markdown fences) as an array of 5-7 exercises with these exact keys:
+name, sets, reps, rest, muscle_group, tips
+
+Example:
+[
+  {{"name": "Barbell Squats", "sets": 4, "reps": "10", "rest": "90s", "muscle_group": "Legs", "tips": "Keep knees over toes"}},
+  {{"name": "Push-ups", "sets": 3, "reps": "15", "rest": "60s", "muscle_group": "Chest", "tips": "Full range of motion"}},
+  {{"name": "Bent-over Rows", "sets": 3, "reps": "12", "rest": "60s", "muscle_group": "Back", "tips": "Squeeze shoulder blades"}},
+  {{"name": "Overhead Press", "sets": 3, "reps": "10", "rest": "60s", "muscle_group": "Shoulders", "tips": "Core tight throughout"}},
+  {{"name": "Plank Hold", "sets": 3, "reps": "45s", "rest": "30s", "muscle_group": "Core", "tips": "Keep body in straight line"}}
+]"""
+
     try:
         response = await llm_complete(
             system=system,
             user_text="Generate a personalized workout for today",
             max_tokens=1000,
         )
-        clean = response.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        clean = response.strip()
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+            clean = clean.rsplit("```", 1)[0]
         exercises = json.loads(clean)
     except Exception as e:
         logger.error(f"Workout parse error: {e}")
@@ -855,12 +897,17 @@ Return ONLY valid JSON (no markdown fences) as an array of exercises with keys: 
             {"name": "Barbell Squats", "sets": 4, "reps": "10", "rest": "90s", "muscle_group": "Legs", "tips": "Keep knees over toes"},
             {"name": "Push-ups", "sets": 3, "reps": "15", "rest": "60s", "muscle_group": "Chest", "tips": "Full range of motion"},
             {"name": "Bent-over Rows", "sets": 3, "reps": "12", "rest": "60s", "muscle_group": "Back", "tips": "Squeeze shoulder blades"},
-            {"name": "Plank Hold", "sets": 3, "reps": "45s", "rest": "30s", "muscle_group": "Core", "tips": "Keep body straight"},
+            {"name": "Overhead Press", "sets": 3, "reps": "10", "rest": "60s", "muscle_group": "Shoulders", "tips": "Core tight throughout"},
+            {"name": "Plank Hold", "sets": 3, "reps": "45s", "rest": "30s", "muscle_group": "Core", "tips": "Keep body in straight line"},
+            {"name": "Lunges", "sets": 3, "reps": "12 each leg", "rest": "60s", "muscle_group": "Legs", "tips": "Step far enough forward"},
         ]
+
     workout_id = f"workout_{uuid.uuid4().hex[:12]}"
-    doc = {"workout_id": workout_id, "user_id": user_id, "exercises": exercises,
-           "date": datetime.now(timezone.utc).date().isoformat(), "completed": False,
-           "created_at": datetime.now(timezone.utc).isoformat()}
+    doc = {
+        "workout_id": workout_id, "user_id": user_id, "exercises": exercises,
+        "date": datetime.now(timezone.utc).date().isoformat(), "completed": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
     await db.workouts.insert_one(doc)
     return {"workout_id": workout_id, "exercises": exercises, "date": doc["date"]}
 
@@ -886,9 +933,11 @@ async def export_workout_pdf(workout_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Workout not found")
     user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     user_name = user_doc.get("name", "User") if user_doc else "User"
-    return StreamingResponse(io.BytesIO(generate_workout_pdf(workout, user_name)),
+    return StreamingResponse(
+        io.BytesIO(generate_workout_pdf(workout, user_name)),
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=workout_{workout.get('date', 'today')}.pdf"})
+        headers={"Content-Disposition": f"attachment; filename=workout_{workout.get('date', 'today')}.pdf"},
+    )
 
 # ============ Progress Endpoints ============
 
@@ -896,12 +945,14 @@ async def export_workout_pdf(workout_id: str, request: Request):
 async def add_progress(entry: ProgressEntry, request: Request):
     user_id = await get_current_user(request)
     metric_id = f"metric_{uuid.uuid4().hex[:12]}"
-    doc = {"metric_id": metric_id, "user_id": user_id,
-           "weight": entry.weight, "bmi": entry.bmi, "body_fat": entry.body_fat,
-           "muscle_mass": entry.muscle_mass, "calories_burned": entry.calories_burned,
-           "workout_minutes": entry.workout_minutes,
-           "date": datetime.now(timezone.utc).date().isoformat(),
-           "created_at": datetime.now(timezone.utc).isoformat()}
+    doc = {
+        "metric_id": metric_id, "user_id": user_id,
+        "weight": entry.weight, "bmi": entry.bmi, "body_fat": entry.body_fat,
+        "muscle_mass": entry.muscle_mass, "calories_burned": entry.calories_burned,
+        "workout_minutes": entry.workout_minutes,
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
     await db.progress_metrics.insert_one(doc)
     return {"metric_id": metric_id}
 
@@ -924,8 +975,10 @@ async def get_progress_summary(request: Request):
         trend = "gaining" if diff > 0 else "losing" if diff < 0 else "maintaining"
     total_workouts = await db.workouts.count_documents({"user_id": user_id, "completed": True})
     total_meals = await db.meal_plans.count_documents({"user_id": user_id})
-    return {"total_entries": len(metrics), "latest": latest, "trend": trend,
-            "total_workouts_completed": total_workouts, "total_meal_plans": total_meals}
+    return {
+        "total_entries": len(metrics), "latest": latest, "trend": trend,
+        "total_workouts_completed": total_workouts, "total_meal_plans": total_meals,
+    }
 
 # ============ RAG Cache Endpoints ============
 
@@ -945,10 +998,13 @@ async def get_rag_status(request: Request):
     statuses = []
     for intent, sources in SCRAPE_SOURCES.items():
         cached = await db.scrape_cache.find_one({"cache_key": f"scrape_cache_{intent}"}, {"_id": 0})
-        statuses.append({"intent": intent, "sources": [s["name"] for s in sources],
-                          "cached": cached is not None,
-                          "cached_at": cached.get("cached_at") if cached else None,
-                          "content_length": len(cached.get("content", "")) if cached else 0})
+        statuses.append({
+            "intent": intent,
+            "sources": [s["name"] for s in sources],
+            "cached": cached is not None,
+            "cached_at": cached.get("cached_at") if cached else None,
+            "content_length": len(cached.get("content", "")) if cached else 0,
+        })
     return {"knowledge_sources": statuses}
 
 # ============ Register router ============
